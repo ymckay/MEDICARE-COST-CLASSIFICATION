@@ -1,0 +1,478 @@
+# =============================================================================
+# Medicare Beneficiary Cost Classification
+# ISYE 7406 - Data Mining and Statistical Learning | Georgia Tech
+# Author: Yakira McKay
+# Date: April 2026
+# =============================================================================
+# Description:
+# Binary classification of Medicare beneficiaries (High Cost vs Standard Cost)
+# using the CMS DE-SynPUF 2009 Beneficiary Summary File.
+# Models: Logistic Regression, Decision Tree, Random Forest, Gradient Boosting, KNN
+# =============================================================================
+ 
+# ------------------------------------------------------------------------------
+# 1. LIBRARIES
+# ------------------------------------------------------------------------------
+library(dplyr)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(ranger)
+library(gbm)
+library(ggplot2)
+library(car)
+library(class)  # for knn()
+ 
+# Note: xgboost loaded in original but not used; removed to keep dependencies clean
+ 
+# ------------------------------------------------------------------------------
+# 2. LOAD DATA
+# ------------------------------------------------------------------------------
+# Download dataset from:
+# https://www.cms.gov/research-statistics-data-and-systems/downloadable-public-use-files/synpufs
+# Place CSV in your working directory before running
+ 
+data <- read.csv('DE1_0_2009_Beneficiary_Summary_File_Sample_1.csv', header = TRUE)
+dim(data)
+summary(data)
+ 
+df <- data
+ 
+# ------------------------------------------------------------------------------
+# 3. PREPROCESSING
+# ------------------------------------------------------------------------------
+ 
+# Remove deceased beneficiaries (death date = data leakage)
+df <- df[is.na(df$BENE_DEATH_DT), ]
+ 
+# Convert demographic and chronic condition columns to factors
+df[4:6]   <- lapply(df[4:6], as.factor)
+df[13:23] <- lapply(df[13:23], as.factor)
+ 
+# Derive age from date of birth (as of 2009)
+df$BENE_BIRTH_DT <- as.Date(as.character(df$BENE_BIRTH_DT), format = "%Y%m%d")
+df$age <- round(as.numeric(difftime(as.Date("2009-12-31"), df$BENE_BIRTH_DT, units = "days")) / 365, 1)
+ 
+# Group state codes into regions to reduce dimensionality
+northeast <- c("09", "23", "25", "33", "44", "50", "34", "36", "42")
+south     <- c("10", "11", "12", "13", "24", "37", "45", "51", "54", "01", "21", "28", "47", "05", "22", "40", "48")
+midwest   <- c("17", "18", "26", "39", "55", "19", "20", "27", "29", "31", "38", "46")
+west      <- c("04", "08", "16", "35", "30", "32", "49", "56", "02", "06", "15", "41", "53")
+ 
+df <- df %>%
+  mutate(region = case_when(
+    SP_STATE_CODE %in% northeast ~ "Northeast",
+    SP_STATE_CODE %in% south     ~ "South",
+    SP_STATE_CODE %in% midwest   ~ "Midwest",
+    SP_STATE_CODE %in% west      ~ "West",
+    TRUE                         ~ "Other"
+  ))
+ 
+# Recode chronic condition indicators: 1 = Yes, 0 = No (originally 1/2)
+chronic_vars <- c("SP_ALZHDMTA", "SP_CHF", "SP_CHRNKIDN", "SP_CNCR",
+                  "SP_COPD", "SP_DEPRESSN", "SP_DIABETES", "SP_ISCHMCHT",
+                  "SP_OSTEOPRS", "SP_RA_OA", "SP_STRKETIA")
+ 
+df <- df %>%
+  mutate(across(all_of(chronic_vars), ~ ifelse(. == 1, 1, 0)))
+ 
+# Recode sex and ESRD to binary 0/1
+df$BENE_SEX_IDENT_CD <- ifelse(df$BENE_SEX_IDENT_CD == 1, 1, 0)
+df$BENE_ESRD_IND     <- as.integer(ifelse(df$BENE_ESRD_IND == "Y", 1, 0))
+ 
+# Construct total Medicare cost and apply log(x+1) transformation
+df$MEDERE_COST     <- df$MEDREIMB_IP + df$MEDREIMB_OP + df$MEDREIMB_CAR
+df                 <- df %>% filter(MEDERE_COST >= 0)
+df$MEDERE_COST_Log <- log(df$MEDERE_COST + 1)
+ 
+# Define binary response: top 33% = High Cost, remainder = Standard Cost
+threshold_67       <- quantile(df$MEDERE_COST_Log, probs = 0.67)
+df$Cost_Factor     <- ifelse(df$MEDERE_COST_Log <= threshold_67, "Standard", "High")
+ 
+# Drop columns not used in modeling
+df <- df %>%
+  select(-SP_STATE_CODE, -BENE_COUNTY_CD, -DESYNPUF_ID, -BENE_DEATH_DT,
+         -BENRES_IP, -BENRES_OP, -BENRES_CAR,
+         -PPPYMT_CAR, -PPPYMT_OP, -PPPYMT_IP,
+         -BENE_BIRTH_DT)
+ 
+# ------------------------------------------------------------------------------
+# 4. EXPLORATORY DATA ANALYSIS
+# ------------------------------------------------------------------------------
+ 
+# Cost distribution: raw vs log-transformed
+par(mfrow = c(2, 1))
+hist(df$MEDERE_COST,
+     main = "Raw Medicare Cost", xlab = "Cost ($)", col = "steelblue", breaks = 50)
+hist(df$MEDERE_COST_Log,
+     main = "Log Transformed Cost", xlab = "Log Cost", col = "steelblue", breaks = 50)
+ 
+# Chronic disease prevalence by cost tier
+par(mfrow = c(3, 4))
+for (var in chronic_vars) {
+  rate <- tapply(df[[var]], df$Cost_Factor, mean)
+  barplot(rate, main = var, col = c("steelblue", "tomato"),
+          ylab = "Proportion", ylim = c(0, 1))
+}
+ 
+# Age distribution by cost tier
+par(mfrow = c(2, 1))
+hist(df$age[df$Cost_Factor == "High"],
+     main = "High Cost Age Distribution", xlab = "Age")
+hist(df$age[df$Cost_Factor == "Standard"],
+     main = "Standard Cost Age Distribution", xlab = "Age")
+ 
+# Race distribution
+prop.table(table(df$BENE_RACE_CD))
+ 
+ggplot(df, aes(x = factor(BENE_RACE_CD,
+                           levels = c(1, 2, 3, 5),
+                           labels = c("White", "Black", "Other", "Hispanic")),
+               fill = factor(BENE_RACE_CD))) +
+  geom_bar() +
+  scale_fill_brewer(palette = "Dark2") +
+  labs(title = "Frequency of Race", x = "Race", y = "Count") +
+  theme_minimal()
+ 
+# ------------------------------------------------------------------------------
+# 5. MODEL DATASET & DATA SPLIT
+# ------------------------------------------------------------------------------
+ 
+# Remove cost variables used only for target construction
+df_model <- df %>%
+  select(-MEDERE_COST_Log, -MEDERE_COST, -MEDREIMB_IP, -MEDREIMB_OP, -MEDREIMB_CAR) %>%
+  mutate(across(c(Cost_Factor, region), as.factor))
+ 
+set.seed(123)
+train_index <- createDataPartition(df_model$Cost_Factor, p = 0.70, list = FALSE)
+train       <- df_model[train_index, ]
+step        <- df_model[-train_index, ]
+ 
+val_index   <- createDataPartition(step$Cost_Factor, p = 0.50, list = FALSE)
+validation  <- step[val_index, ]
+test        <- step[-val_index, ]
+ 
+# Verify class balance is preserved across splits
+round(prop.table(table(df_model$Cost_Factor)), 3)
+round(prop.table(table(train$Cost_Factor)), 3)
+round(prop.table(table(validation$Cost_Factor)), 3)
+round(prop.table(table(test$Cost_Factor)), 3)
+ 
+# ------------------------------------------------------------------------------
+# 6. KNN PREPROCESSING (dummy encoding + scaling)
+#    Done before tuning so scaled sets are ready for all KNN loops
+# ------------------------------------------------------------------------------
+ 
+factor_cols <- setdiff(names(train), c("age", "BENE_HI_CVRAGE_TOT_MONS",
+                                        "BENE_SMI_CVRAGE_TOT_MONS",
+                                        "BENE_HMO_CVRAGE_TOT_MONS",
+                                        "PLAN_CVRG_MOS_NUM"))
+PP_train      <- train
+PP_validation <- validation
+PP_Test       <- test
+ 
+PP_train[factor_cols]      <- lapply(PP_train[factor_cols], as.factor)
+PP_validation[factor_cols] <- lapply(PP_validation[factor_cols], as.factor)
+PP_Test[factor_cols]       <- lapply(PP_Test[factor_cols], as.factor)
+ 
+y_train <- PP_train$Cost_Factor
+y_valid <- PP_validation$Cost_Factor
+y_test  <- PP_Test$Cost_Factor
+ 
+x_train <- PP_train %>% select(-Cost_Factor)
+x_valid <- PP_validation %>% select(-Cost_Factor)
+x_test  <- PP_Test %>% select(-Cost_Factor)
+ 
+dummies        <- dummyVars(~ ., data = x_train)
+x_train_dummy  <- predict(dummies, newdata = x_train) %>% as.data.frame()
+x_valid_dummy  <- predict(dummies, newdata = x_valid) %>% as.data.frame()
+x_test_dummy   <- predict(dummies, newdata = x_test)  %>% as.data.frame()
+ 
+pp             <- preProcess(x_train_dummy, method = c("center", "scale"))
+x_train_scaled <- predict(pp, x_train_dummy)
+x_valid_scaled <- predict(pp, x_valid_dummy)
+x_test_scaled  <- predict(pp, x_test_dummy)
+ 
+# ------------------------------------------------------------------------------
+# 7. HYPERPARAMETER TUNING (Validation Set)
+# ------------------------------------------------------------------------------
+ 
+# --- 7a. Logistic Regression ---
+Logistic_model  <- glm(Cost_Factor ~ ., data = train, family = binomial)
+vif_results     <- vif(Logistic_model)
+ 
+par(mfrow = c(2, 2))
+plot(Logistic_model)
+ 
+log_pred_val    <- predict(Logistic_model, newdata = validation, type = "response")
+thresholds      <- c(0.5, 0.6, 0.7, 0.8)
+Logistic_Results <- data.frame()
+ 
+for (t in thresholds) {
+  log_class <- ifelse(log_pred_val <= t, "High", "Standard")
+  conf      <- confusionMatrix(as.factor(log_class), validation$Cost_Factor, positive = "High")
+  Logistic_Results <- rbind(Logistic_Results, data.frame(
+    threshold = t,
+    Recall    = conf$byClass["Sensitivity"],
+    F1        = conf$byClass["F1"],
+    kappa     = conf$overall["Kappa"]
+  ))
+}
+Logistic_Results
+ 
+# --- 7b. Decision Tree ---
+tree_params  <- expand.grid(cp = c(0.0001, 0.0005, 0.001, 0.005), minsplit = c(500, 750))
+Tree_results <- data.frame()
+ 
+for (i in 1:nrow(tree_params)) {
+  tree_model <- rpart(Cost_Factor ~ ., data = train, method = "class",
+                      control = rpart.control(cp       = tree_params$cp[i],
+                                              minsplit = tree_params$minsplit[i]))
+  tree_pred  <- predict(tree_model, validation, type = "class")
+  conf       <- confusionMatrix(tree_pred, validation$Cost_Factor, positive = "High")
+  Tree_results <- rbind(Tree_results, cbind(
+    tree_params[i, ],
+    minbucket         = tree_model$control$minbucket,
+    Recall            = conf$byClass["Sensitivity"],
+    f1_Score          = conf$byClass["F1"],
+    Cohen_Kappa_Measure = conf$overall["Kappa"]
+  ))
+}
+Tree_results
+ 
+# --- 7c. Random Forest ---
+RF_params  <- expand.grid(mtry = c(4, 5), min.node.size = c(2, 6, 12))
+RF_results <- data.frame()
+ 
+for (i in 1:nrow(RF_params)) {
+  rf_model <- ranger(Cost_Factor ~ ., data = train,
+                     mtry          = RF_params$mtry[i],
+                     min.node.size = RF_params$min.node.size[i],
+                     splitrule     = "gini",
+                     num.trees     = 500,
+                     importance    = "impurity",
+                     probability   = FALSE)
+  rf_pred  <- predict(rf_model, data = validation)$predictions
+  conf     <- confusionMatrix(rf_pred, validation$Cost_Factor, positive = "High")
+  RF_results <- rbind(RF_results, data.frame(
+    mtry                = RF_params$mtry[i],
+    min.node.size       = RF_params$min.node.size[i],
+    num.trees           = 500,
+    Recall              = conf$byClass["Sensitivity"],
+    f1_Score            = conf$byClass["F1"],
+    Cohen_Kappa_Measure = conf$overall["Kappa"]
+  ))
+}
+RF_results
+ 
+# --- 7d. Gradient Boosting ---
+train_num             <- train
+train_num$Cost_Factor <- ifelse(train$Cost_Factor == "High", 1, 0)
+validation_num             <- validation
+validation_num$Cost_Factor <- ifelse(validation$Cost_Factor == "High", 1, 0)
+test_num             <- test
+test_num$Cost_Factor <- ifelse(test$Cost_Factor == "High", 1, 0)
+ 
+Boost_params  <- expand.grid(shrinkage = c(0.05, 0.1), n.minobsinnode = c(10, 20, 30))
+Boost_results <- data.frame()
+ 
+for (i in 1:nrow(Boost_params)) {
+  boost_model <- gbm(Cost_Factor ~ ., data = train_num,
+                     distribution    = "bernoulli",
+                     n.trees         = 300,
+                     interaction.depth = 5,
+                     shrinkage       = Boost_params$shrinkage[i],
+                     n.minobsinnode  = Boost_params$n.minobsinnode[i],
+                     cv.folds        = 5,
+                     verbose         = FALSE)
+  best_iter   <- gbm.perf(boost_model, method = "cv", plot.it = FALSE)
+  boost_prob  <- predict(boost_model, newdata = validation_num,
+                         n.trees = best_iter, type = "response")
+  boost_class <- factor(ifelse(boost_prob <= 0.5, "Standard", "High"),
+                        levels = levels(validation$Cost_Factor))
+  conf        <- confusionMatrix(boost_class, validation$Cost_Factor, positive = "High")
+  Boost_results <- rbind(Boost_results, data.frame(
+    n.trees        = boost_model$n.trees,
+    interaction.depth = 5,
+    shrinkage      = Boost_params$shrinkage[i],
+    n.minobsinnode = Boost_params$n.minobsinnode[i],
+    best_iter      = best_iter,
+    Recall         = conf$byClass["Sensitivity"],
+    F1             = conf$byClass["F1"],
+    kappa          = conf$overall["Kappa"]
+  ))
+}
+Boost_results
+ 
+# --- 7e. K-Nearest Neighbors ---
+k_vals      <- c(3, 7, 11, 15, 21, 31)
+KNN_Results <- data.frame()
+ 
+for (k in k_vals) {
+  pred <- knn(train = x_train_scaled, test = x_valid_scaled, cl = y_train, k = k)
+  conf <- confusionMatrix(pred, y_valid, positive = "High")
+  KNN_Results <- rbind(KNN_Results, data.frame(
+    k      = k,
+    Recall = conf$byClass["Sensitivity"],
+    F1     = conf$byClass["F1"],
+    kappa  = conf$overall["Kappa"]
+  ))
+}
+KNN_Results
+ 
+# ------------------------------------------------------------------------------
+# 8. SELECT BEST PARAMETERS FROM VALIDATION
+# ------------------------------------------------------------------------------
+ 
+Logistic_Results[] <- lapply(Logistic_Results, as.numeric)
+Top_Log_Results1   <- Logistic_Results[order(-Logistic_Results$F1,
+                                              -Logistic_Results$Recall,
+                                              -Logistic_Results$kappa), ][1, ]
+ 
+Tree_results[]   <- lapply(Tree_results, as.numeric)
+Top_val_tree1    <- Tree_results[order(-Tree_results$Recall,
+                                       -Tree_results$f1_Score,
+                                       -Tree_results$Cohen_Kappa_Measure), ][1, ]
+ 
+RF_results[]   <- lapply(RF_results, as.numeric)
+Top_val_rf1    <- RF_results[order(-RF_results$Recall,
+                                    -RF_results$f1_Score,
+                                    -RF_results$Cohen_Kappa_Measure), ][1, ]
+ 
+Boost_results[] <- lapply(Boost_results, as.numeric)
+Top_val_boost1  <- Boost_results[order(-Boost_results$Recall,
+                                        -Boost_results$F1,
+                                        -Boost_results$kappa), ][1, ]
+ 
+KNN_Results[]  <- lapply(KNN_Results, as.numeric)
+Top_val_KNN1   <- KNN_Results[order(-KNN_Results$Recall,
+                                     -KNN_Results$F1,
+                                     -KNN_Results$kappa), ][1, ]
+ 
+# ------------------------------------------------------------------------------
+# 9. FINAL TEST SET EVALUATION
+# ------------------------------------------------------------------------------
+ 
+# --- Logistic Regression ---
+log_pred_test <- predict(Logistic_model, newdata = test, type = "response")
+log_class     <- as.factor(ifelse(log_pred_test <= Top_Log_Results1$threshold, "High", "Standard"))
+Log_conf      <- confusionMatrix(log_class, test$Cost_Factor, positive = "High")
+Log_conf
+ 
+# Variable importance: top 10 coefficients
+coef_df <- data.frame(Variable    = names(Logistic_model$coefficients[-1]),
+                      Coefficient = abs(as.numeric(Logistic_model$coefficients[-1])))
+coef_df <- coef_df[order(-coef_df$Coefficient), ][1:10, ]
+par(mfrow = c(1, 1))
+barplot(coef_df$Coefficient, names.arg = coef_df$Variable, las = 2,
+        main = "Top Logistic Regression Coefficients", ylab = "Coefficient")
+abline(h = 0)
+ 
+# --- Decision Tree ---
+Best_Tree <- rpart(Cost_Factor ~ ., data = train,
+                   cp        = Top_val_tree1$cp,
+                   minsplit  = Top_val_tree1$minsplit,
+                   minbucket = Top_val_tree1$minbucket)
+Tree_Pred <- predict(Best_Tree, test, type = "class")
+Tree_conf <- confusionMatrix(Tree_Pred, test$Cost_Factor, positive = "High")
+Tree_conf
+ 
+Best_Tree$variable.importance[1:10]
+ 
+pruned_tree <- prune(Best_Tree, cp = 0.005)
+par(mfrow = c(1, 1))
+rpart.plot(pruned_tree, type = 4, extra = 100, fallen.leaves = TRUE, tweak = 1,
+           main = "Best Decision Tree (Pruned)")
+ 
+# --- Random Forest ---
+Best_RF <- ranger(Cost_Factor ~ ., data = train,
+                  mtry          = Top_val_rf1$mtry,
+                  min.node.size = Top_val_rf1$min.node.size,
+                  num.trees     = Top_val_rf1$num.trees,
+                  importance    = "impurity")
+RF_Pred  <- predict(Best_RF, data = test)$predictions
+RF_conf  <- confusionMatrix(RF_Pred, test$Cost_Factor, positive = "High")
+RF_conf
+ 
+var_imp <- sort(Best_RF$variable.importance, decreasing = TRUE)[1:10]
+par(mfrow = c(1, 1))
+barplot(var_imp, horiz = TRUE, las = 1,
+        col  = colorRampPalette(c("steelblue", "lightblue"))(10),
+        main = "Top Random Forest Variable Importance",
+        xlab = "Importance")
+ 
+# --- Gradient Boosting ---
+Best_Boost  <- gbm(Cost_Factor ~ ., data = train_num,
+                   distribution      = "bernoulli",
+                   n.trees           = Top_val_boost1$best_iter,
+                   interaction.depth = Top_val_boost1$interaction.depth,
+                   shrinkage         = Top_val_boost1$shrinkage,
+                   n.minobsinnode    = Top_val_boost1$n.minobsinnode,
+                   verbose           = FALSE)
+Boost_Pred  <- predict(Best_Boost, test_num, type = "response")
+Boost_Class <- as.factor(ifelse(Boost_Pred <= 0.5, "Standard", "High"))
+Boost_conf  <- confusionMatrix(Boost_Class, test$Cost_Factor, positive = "High")
+Boost_conf
+ 
+boost_summary <- summary(Best_Boost, plotit = FALSE)
+top10 <- boost_summary[1:10, ]
+par(mar = c(5, 10, 4, 2))
+barplot(top10$rel.inf, names.arg = top10$var, horiz = TRUE, las = 1,
+        col  = colorRampPalette(c("darkgreen", "lightgreen"))(10),
+        main = "Top Gradient Boosting Variable Importance",
+        xlab = "Relative Influence")
+ 
+# --- KNN ---
+Best_KNN <- knn(train = x_train_scaled, test = x_test_scaled,
+                cl = y_train, k = Top_val_KNN1$k[1])
+Knn_conf <- confusionMatrix(Best_KNN, y_test, positive = "High")
+Knn_conf
+ 
+# ------------------------------------------------------------------------------
+# 10. MODEL COMPARISON
+# ------------------------------------------------------------------------------
+ 
+c_results <- list(
+  Logistic_Classification = Log_conf,
+  Decision_Tree           = Tree_conf,
+  Random_Forrest          = RF_conf,
+  Boost_Model             = Boost_conf,
+  KNN_Model               = Knn_conf
+)
+ 
+Model_results <- data.frame(
+  Model  = names(c_results),
+  Recall = sapply(c_results, function(x) x$byClass["Recall"]),
+  F1     = sapply(c_results, function(x) x$byClass["F1"]),
+  kappa  = sapply(c_results, function(x) x$overall["Kappa"]),
+  row.names = NULL
+) %>%
+  arrange(desc(Recall), desc(F1), desc(kappa))
+ 
+Model_results
+ 
+# --- McNemar's Test (pairwise vs Logistic Regression) ---
+rf_pred_test   <- predict(Best_RF, data = test)$predictions
+tree_pred_test <- predict(Best_Tree, test, type = "class")
+ 
+Mcnemar_Results <- data.frame(Model_Compared = character(),
+                               Chi_Square     = numeric(),
+                               P_Value        = numeric())
+ 
+pairs <- list(
+  list(name = "Gradient Boosting", pred = Boost_Class),
+  list(name = "Random Forest",     pred = rf_pred_test),
+  list(name = "Decision Tree",     pred = tree_pred_test),
+  list(name = "K Nearest Neighbor",pred = Best_KNN)
+)
+ 
+for (p in pairs) {
+  tbl    <- table(log_class, p$pred)
+  result <- mcnemar.test(tbl)
+  Mcnemar_Results <- Mcnemar_Results %>%
+    add_row(Model_Compared = p$name,
+            Chi_Square     = as.numeric(result$statistic),
+            P_Value        = round(result$p.value, 3))
+}
+ 
+Mcnemar_Results
