@@ -12,14 +12,14 @@ Binary classification of high-cost Medicare beneficiaries using logistic regress
 
 Health insurance pricing depends on accurately estimating the expected cost of claims per policyholder. Mispricing can lead to profitability issues, poor resource allocation, and inequitable outcomes for patients. This project builds a binary classification model to predict whether a Medicare beneficiary falls into a **High Cost** or **Standard Cost** category, using clinical and demographic variables from a large synthetic Medicare dataset.
 
-The analysis prioritizes **recall for the high-cost class**, reflecting the real-world consequence that failing to identify a high-cost patient carries greater risk than a false positive. Fairness is also evaluated — specifically whether demographic variables such as race, sex, and geographic region disproportionately drive predictions.
+The analysis prioritizes **recall for the high-cost class**, reflecting the real-world consequence that failing to identify a high-cost patient carries greater risk than a false positive. Fairness is also evaluated, specifically whether demographic variables such as race, sex, and geographic region disproportionately drive predictions.
 
 ---
 
 ## Dataset
 
 - **Source:** [CMS Linkable 2008–2010 Medicare Data Entrepreneurs' Synthetic Public Use File (DE-SynPUF)](https://www.cms.gov/research-statistics-data-and-systems/downloadable-public-use-files/synpufs)
-- **File Used:** DE1.0 Sample 1 — 2009 Beneficiary Summary File
+- **File Used:** DE1.0 Sample 1 - 2009 Beneficiary Summary File
 - **Raw Records:** 114,538 synthetic Medicare beneficiary records
 - **Final Modeling Dataset:** 112,752 records (deceased beneficiaries excluded), 20 predictor variables
 - **Note:** This dataset is synthetic and designed to preserve the structure of real Medicare claims data while protecting privacy. Findings are intended for methodological demonstration only.
