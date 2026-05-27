@@ -4,7 +4,7 @@ Binary classification of high-cost Medicare beneficiaries using logistic regress
 # Medicare Beneficiary Cost Classification
 
 > Can machine learning identify high-cost Medicare patients without relying on demographic variables?  
-> This R-based analysis compares five supervised classifiers on 112K+ synthetic CMS records — with logistic regression achieving a recall of **0.829** for the high-cost class.
+> This R-based analysis compares five supervised classifiers on 112K+ synthetic CMS records  with logistic regression achieving a recall of **0.829** for the high-cost class.
 
 ---
 
